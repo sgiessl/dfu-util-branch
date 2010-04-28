@@ -1,7 +1,8 @@
 /*
- * dfu-programmer
+ * dfu-util - DFU CRC / file suffix
  *
- * $Id: dfu.c,v 1.3 2006/06/20 06:28:04 schmidtw Exp $
+ * Copyright (C) 2007-2008 by Harald Welte <laforge@gnumonks.org>
+ * Copyright (C) 2010      by Sandro Giessl <s.giessl@niftylight.de>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,38 +20,56 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+
 #include <usb.h>
 #include "dfu.h"
+#include "dfu_sm.h"
+#include "crc32.h"
 
-/* DFU commands */
-#define DFU_DETACH      0
-#define DFU_DNLOAD      1
-#define DFU_UPLOAD      2
-#define DFU_GETSTATUS   3
-#define DFU_CLRSTATUS   4
-#define DFU_GETSTATE    5
-#define DFU_ABORT       6
+static int _dfu_verify_init(dfu_handle *handle, const char *function );
+
+/* ugly hack for Win32 */
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
 #define INVALID_DFU_TIMEOUT -1
 
-static int dfu_timeout = INVALID_DFU_TIMEOUT;
-static unsigned short transaction = 0;
-
 static int dfu_debug_level = 0;
 
-void dfu_init( const int timeout )
+void dfu_init( dfu_handle *handle,
+	      const int usb_timeout)
 {
-    if( timeout > 0 ) {
-        dfu_timeout = timeout;
-    } else {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr, "dfu_init: Invalid timeout value.\n" );
-    }
+	if(!handle)
+		fprintf( stderr, "dfu_init: Invalid handle.\n" );
+
+	handle->device = NULL;
+	handle->interface = 0;
+	handle->dfu_ver = DFU_VERSION_1_0;
+
+	dfu_sm_set_state_unchecked(handle, DFU_STATE_appIDLE);
+
+	handle->transaction = 0;
+
+	handle->usb_timeout = -1;
+	if( usb_timeout > 0 ) {
+		handle->usb_timeout = usb_timeout;
+	} else {
+		if( 0 != dfu_debug_level )
+			fprintf( stderr, "dfu_init: Invalid timeout value.\n" );
+	}
 }
 
-static int dfu_verify_init( const char *function )
+static int _dfu_verify_init(dfu_handle *handle, const char *function )
 {
-    if( INVALID_DFU_TIMEOUT == dfu_timeout ) {
+    if( !handle || INVALID_DFU_TIMEOUT == handle->usb_timeout ) {
         if( 0 != dfu_debug_level )
             fprintf( stderr,
                      "%s: dfu system not property initialized.\n",
@@ -66,6 +85,35 @@ void dfu_debug( const int level )
     dfu_debug_level = level;
 }
 
+/* ensure that the device state is equal to the currently expected
+   device state */
+static int _dfu_state_verify(dfu_handle *handle,
+			     int expected_state,
+			     const char *function)
+{
+	/* only do the validation in states where it's allowed to
+	   request the device's state. */
+	if(dfu_sm_get_next_state(handle, DFU_EV_GETSTATE, 0) < 0)
+	{
+		/* otherwise silently return, without invoking an
+		   error. */
+		return 0;
+	}
+
+	int device_state = dfu_get_state(handle);
+
+	if(device_state != expected_state)
+	{
+		fprintf( stderr,
+			 "%s: FATAL! The DFU device is in state %s, but we expected it to be in %s\n",
+			 function,
+			 dfu_state_to_string(device_state),
+			 dfu_state_to_string(expected_state));
+		return -1;
+	}
+
+	return 0;
+}
 
 /*
  *  DFU_DETACH Request (DFU Spec 1.0, Section 5.1)
@@ -77,23 +125,86 @@ void dfu_debug( const int level )
  *
  *  returns 0 or < 0 on error
  */
-int dfu_detach( struct usb_dev_handle *device,
-                const unsigned short interface,
+int dfu_detach( dfu_handle *handle,
                 const unsigned short timeout )
 {
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	int next_state = -1;
 
-    return usb_control_msg( device,
-        /* bmRequestType */ USB_ENDPOINT_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-        /* bRequest      */ DFU_DETACH,
-        /* wValue        */ timeout,
-        /* wIndex        */ interface,
-        /* Data          */ NULL,
-        /* wLength       */ 0,
-                            dfu_timeout );
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_DETACH, 0)) < 0)
+		return -1;
+
+	/* do the actual "work" */
+	if(usb_dfu_handlers(handle->dfu_ver)->detach(handle,
+					timeout) < 0)
+		return -1;
+
+	if(_dfu_state_verify(handle, next_state, __FUNCTION__) < 0)
+		return -1;
+
+	return dfu_sm_set_state_checked(handle, next_state);
 }
 
+/*
+ *  DFU USB Reset
+ *
+ *  device    - the usb_dev_handle to communicate with
+ *  interface - the interface to communicate with
+ *
+ *  returns 0 or < 0 on error
+ */
+int dfu_usb_reset( dfu_handle *handle )
+{
+	int ret = -1;
+	int next_state = -1;
+
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
+
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_USB_RESET, 0)) < 0)
+		return -1;
+
+	/* do the actual "work" */
+	if( (ret = usb_dfu_handlers(handle->dfu_ver)->device_reset(handle)) < 0)
+		return -1;
+
+	return dfu_sm_set_state_checked(handle, next_state);
+}
+
+/*
+ * perform/await DFU status poll timeout
+ *
+ *  device    - the usb_dev_handle to communicate with
+ *  interface - the interface to communicate with
+ *  poll_timeout - the timeout the host is expected to wait, in milliseconds
+ *
+ *  returns 0 or < 0 on error
+ */
+int dfu_status_poll_timeout( dfu_handle *handle,
+			     unsigned int poll_timeout )
+{
+	int next_state = -1;
+
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
+
+	int guards = 0;
+
+	if(handle->func_dfu.bmAttributes & USB_DFU_MANIFEST_TOL)
+		guards |= DFU_GUARD_BIT_MANIFESTATION_TOLERANT;
+
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_STATUS_POLL_TIMEOUT, guards)) < 0)
+		return -1;
+
+	/* do the actual "work" */
+	if(usb_dfu_handlers(handle->dfu_ver)->status_poll_timeout(handle,
+						  poll_timeout) < 0)
+		return -1;
+
+	/* if(_dfu_state_verify(handle, next_state, __FUNCTION__) < 0) */
+	/* 	return -1; */
+
+	return dfu_sm_set_state_checked(handle, next_state);
+}
 
 /*
  *  DFU_DNLOAD Request (DFU Spec 1.0, Section 6.1.1)
@@ -106,48 +217,55 @@ int dfu_detach( struct usb_dev_handle *device,
  *
  *  returns the number of bytes written or < 0 on error
  */
-int dfu_download( struct usb_dev_handle *device,
-                  const unsigned short interface,
+int dfu_download( dfu_handle *handle,
                   const unsigned short length,
                   char* data )
 {
-    int status;
+	int ret = -1;
+	int next_state = -1;
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
 
-    /* Sanity checks */
-    if( (0 != length) && (NULL == data) ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: data was NULL, but length != 0\n",
-                     __FUNCTION__ );
-        return -1;
-    }
+	/* Sanity checks */
+	if( (0 != length) && (NULL == data) ) {
+		if( 0 != dfu_debug_level )
+			fprintf( stderr,
+				 "%s: data was NULL, but length != 0\n",
+				 __FUNCTION__ );
+		return -1;
+	}
+	if( (0 == length) && (NULL != data) ) {
+		if( 0 != dfu_debug_level )
+			fprintf( stderr,
+				 "%s: data was not NULL, but length == 0\n",
+				 __FUNCTION__ );
+		return -2;
+	}
 
-    if( (0 == length) && (NULL != data) ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: data was not NULL, but length == 0\n",
-                     __FUNCTION__ );
-        return -2;
-    }
+	int guards = 0;
+	if(length > 0)
+		guards |= DFU_GUARD_WLENGTH_GT_ZERO;
+	if(handle->func_dfu.bmAttributes & USB_DFU_CAN_DOWNLOAD)
+		guards |= DFU_GUARD_BIT_CAN_DNLOAD;
 
-    status = usb_control_msg( device,
-          /* bmRequestType */ USB_ENDPOINT_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-          /* bRequest      */ DFU_DNLOAD,
-          /* wValue        */ transaction++,
-          /* wIndex        */ interface,
-          /* Data          */ data,
-          /* wLength       */ length,
-                              dfu_timeout );
-    if( status < 0 ) {
-        fprintf( stderr, "%s error %d\n", __FUNCTION__, status );
-    }
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_DNLOAD, guards)) < 0)
+		return -1;
 
-    return status;
+	/* do the actual "work" */
+	if( (ret = usb_dfu_handlers(handle->dfu_ver)->download(handle,
+					       handle->transaction++,
+					       length, data)) < 0)
+		return -1;
+
+	/* if(_dfu_state_verify(handle, next_state, __FUNCTION__) < 0) */
+	/* 	return -1; */
+
+	if(dfu_sm_set_state_checked(handle, next_state) < 0)
+		return -1;
+
+	return ret;
 }
-
 
 /*
  *  DFU_UPLOAD Request (DFU Spec 1.0, Section 6.2)
@@ -160,40 +278,56 @@ int dfu_download( struct usb_dev_handle *device,
  *
  *  returns the number of bytes received or < 0 on error
  */
-int dfu_upload( struct usb_dev_handle *device,
-                const unsigned short interface,
+int dfu_upload( dfu_handle *handle,
                 const unsigned short length,
                 char* data )
 {
-    int status;
+	int ret = -1;
+	int next_state = -1;
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
 
-    /* Sanity checks */
-    if( (0 == length) || (NULL == data) ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: data was NULL, or length is 0\n",
-                     __FUNCTION__ );
-        return -1;
-    }
+	/* Sanity checks */
+	if( (0 == length) || (NULL == data) ) {
+		if( 0 != dfu_debug_level )
+			fprintf( stderr,
+				 "%s: data was NULL, or length is 0\n",
+				 __FUNCTION__ );
+		return -1;
+	}
 
-    status = usb_control_msg( device,
-          /* bmRequestType */ USB_ENDPOINT_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-          /* bRequest      */ DFU_UPLOAD,
-          /* wValue        */ transaction++,
-          /* wIndex        */ interface,
-          /* Data          */ data,
-          /* wLength       */ length,
-                              dfu_timeout );
-    if( status < 0 ) {
-        fprintf( stderr, "%s error %d\n", __FUNCTION__, status );
-    }
+	if(!dfu_sm_state_has_event(handle, DFU_EV_UPLOAD))
+		return -1;
 
-    return status;
+	/* do the actual "work" */
+	if( (ret = usb_dfu_handlers(handle->dfu_ver)->upload(handle,
+					     handle->transaction++,
+					     length, data)) < 0)
+	{
+		return -1;
+	}
+
+	/* determine next state & do state transition */
+	int guards = 0;
+	if(handle->func_dfu.bmAttributes & USB_DFU_CAN_UPLOAD)
+		guards |= DFU_GUARD_BIT_CAN_UPLOAD;
+	if(length > 0)
+		guards |= DFU_GUARD_WLENGTH_GT_ZERO;
+	if(ret < length)
+		guards |= DFU_GUARD_UPLOAD_SHORT_FRAME;
+
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_UPLOAD, guards)) < 0)
+		return -1;
+
+	if(_dfu_state_verify(handle, next_state, __FUNCTION__) < 0)
+		return -1;
+
+	if(dfu_sm_set_state_checked(handle, next_state) < 0)
+		return -1;
+
+	return ret;
 }
-
 
 /*
  *  DFU_GETSTATUS Request (DFU Spec 1.0, Section 6.1.2)
@@ -204,44 +338,26 @@ int dfu_upload( struct usb_dev_handle *device,
  *
  *  return the number of bytes read in or < 0 on an error
  */
-int dfu_get_status( struct usb_dev_handle *device,
-                    const unsigned short interface,
+int dfu_get_status( dfu_handle *handle,
                     struct dfu_status *status )
 {
-    char buffer[6];
-    int result;
+	int next_state = -1;
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
 
-    /* Initialize the status data structure */
-    status->bStatus       = DFU_STATUS_ERROR_UNKNOWN;
-    status->bwPollTimeout = 0;
-    status->bState        = STATE_DFU_ERROR;
-    status->iString       = 0;
+	if(!dfu_sm_state_has_event(handle, DFU_EV_GETSTATUS))
+		return -1;
 
-    result = usb_control_msg( device,
-          /* bmRequestType */ USB_ENDPOINT_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-          /* bRequest      */ DFU_GETSTATUS,
-          /* wValue        */ 0,
-          /* wIndex        */ interface,
-          /* Data          */ buffer,
-          /* wLength       */ 6,
-                              dfu_timeout );
+	/* do the actual "work" */
+	if(usb_dfu_handlers(handle->dfu_ver)->get_status( handle,
+					  status) < 0)
+		return -1;
 
-    if( 6 == result ) {
-        status->bStatus = buffer[0];
-        status->bwPollTimeout = ((0xff & buffer[3]) << 16) |
-                                ((0xff & buffer[2]) << 8)  |
-                                (0xff & buffer[1]);
+	next_state = status->bState;
 
-        status->bState  = buffer[4];
-        status->iString = buffer[5];
-    }
-
-    return result;
+	return dfu_sm_set_state_checked(handle, next_state);
 }
-
 
 /*
  *  DFU_CLRSTATUS Request (DFU Spec 1.0, Section 6.1.3)
@@ -251,61 +367,60 @@ int dfu_get_status( struct usb_dev_handle *device,
  *
  *  return 0 or < 0 on an error
  */
-int dfu_clear_status( struct usb_dev_handle *device,
-                      const unsigned short interface )
+int dfu_clear_status( dfu_handle *handle )
 {
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	int next_state = -1;
 
-    return usb_control_msg( device,
-        /* bmRequestType */ USB_ENDPOINT_OUT| USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-        /* bRequest      */ DFU_CLRSTATUS,
-        /* wValue        */ 0,
-        /* wIndex        */ interface,
-        /* Data          */ NULL,
-        /* wLength       */ 0,
-                            dfu_timeout );
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
+
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_CLRSTATUS, 0)) < 0)
+		return -1;
+
+	/* do the actual "work" */
+	if( usb_dfu_handlers(handle->dfu_ver)->clear_status(handle) < 0)
+		return -1;
+
+
+	if(_dfu_state_verify(handle, next_state, __FUNCTION__) < 0)
+		return -1;
+
+	return dfu_sm_set_state_checked(handle, next_state);
 }
-
 
 /*
  *  DFU_GETSTATE Request (DFU Spec 1.0, Section 6.1.5)
  *
  *  device    - the usb_dev_handle to communicate with
  *  interface - the interface to communicate with
- *  length    - the maximum number of bytes to receive from the USB
- *              device - must be less than wTransferSize
- *  data      - the buffer to put the received data in
  *
  *  returns the state or < 0 on error
  */
-int dfu_get_state( struct usb_dev_handle *device,
-                   const unsigned short interface )
+int dfu_get_state( dfu_handle *handle )
 {
-    int result;
-    char buffer[1];
+	int ret;
+	int next_state = -1;
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
 
-    result = usb_control_msg( device,
-          /* bmRequestType */ USB_ENDPOINT_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-          /* bRequest      */ DFU_GETSTATE,
-          /* wValue        */ 0,
-          /* wIndex        */ interface,
-          /* Data          */ buffer,
-          /* wLength       */ 1,
-                              dfu_timeout );
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_GETSTATE, 0)) < 0)
+		return -1;
 
-    /* Return the error if there is one. */
-    if( result < 1 ) {
-        return result;
-    }
 
-    /* Return the state. */
-    return buffer[0];
+	/* do the actual "work" */
+	if( (ret = usb_dfu_handlers(handle->dfu_ver)->get_state(handle)) < 0)
+		return -1;
+
+
+	/* do not validate the current state here. */
+
+	if(dfu_sm_set_state_checked(handle, next_state) < 0)
+		return -1;
+
+	/* return state */
+	return ret;
 }
-
 
 /*
  *  DFU_ABORT Request (DFU Spec 1.0, Section 6.1.4)
@@ -315,20 +430,26 @@ int dfu_get_state( struct usb_dev_handle *device,
  *
  *  returns 0 or < 0 on an error
  */
-int dfu_abort( struct usb_dev_handle *device,
-               const unsigned short interface )
+int dfu_abort( dfu_handle *handle )
 {
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
+	int next_state = -1;
 
-    return usb_control_msg( device,
-        /* bmRequestType */ USB_ENDPOINT_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-        /* bRequest      */ DFU_ABORT,
-        /* wValue        */ 0,
-        /* wIndex        */ interface,
-        /* Data          */ NULL,
-        /* wLength       */ 0,
-                            dfu_timeout );
+	if( 0 != _dfu_verify_init(handle, __FUNCTION__) )
+		return -1;
+
+	if( (next_state = dfu_sm_get_next_state(handle, DFU_EV_ABORT, 0)) < 0)
+		return -1;
+
+
+	/* do the actual "work" */
+	if(usb_dfu_handlers(handle->dfu_ver)->abort(handle) < 0)
+		return -1;
+
+
+	if(_dfu_state_verify(handle, next_state, __FUNCTION__) < 0)
+		return -1;
+
+	return dfu_sm_set_state_checked(handle, next_state);
 }
 
 
@@ -337,39 +458,42 @@ char* dfu_state_to_string( int state )
     char *message = NULL;
 
     switch( state ) {
-        case STATE_APP_IDLE:
+        case DFU_STATE_appIDLE:
             message = "appIDLE";
             break;
-        case STATE_APP_DETACH:
+        case DFU_STATE_appDETACH:
             message = "appDETACH";
             break;
-        case STATE_DFU_IDLE:
+        case DFU_STATE_dfuIDLE:
             message = "dfuIDLE";
             break;
-        case STATE_DFU_DOWNLOAD_SYNC:
+        case DFU_STATE_dfuDNLOAD_SYNC:
             message = "dfuDNLOAD-SYNC";
             break;
-        case STATE_DFU_DOWNLOAD_BUSY:
+        case DFU_STATE_dfuDNBUSY:
             message = "dfuDNBUSY";
             break;
-        case STATE_DFU_DOWNLOAD_IDLE:
+        case DFU_STATE_dfuDNLOAD_IDLE:
             message = "dfuDNLOAD-IDLE";
             break;
-        case STATE_DFU_MANIFEST_SYNC:
+        case DFU_STATE_dfuMANIFEST_SYNC:
             message = "dfuMANIFEST-SYNC";
             break;
-        case STATE_DFU_MANIFEST:
+        case DFU_STATE_dfuMANIFEST:
             message = "dfuMANIFEST";
             break;
-        case STATE_DFU_MANIFEST_WAIT_RESET:
+        case DFU_STATE_dfuMANIFEST_WAIT_RESET:
             message = "dfuMANIFEST-WAIT-RESET";
             break;
-        case STATE_DFU_UPLOAD_IDLE:
+        case DFU_STATE_dfuUPLOAD_IDLE:
             message = "dfuUPLOAD-IDLE";
             break;
-        case STATE_DFU_ERROR:
+        case DFU_STATE_dfuERROR:
             message = "dfuERROR";
             break;
+        default:
+		message = "n/a";
+		break;
     }
 
     return message;
@@ -418,3 +542,62 @@ const char *dfu_status_to_string(int status)
 	return dfu_status_names[status];
 }
 
+/*
+ * Make a human readable list of provided guards. returned is a
+ * pointer to a static string buffer, so this is NOT multithreading
+ * safe, and you shouldn't keep a reference to the pointer.
+ */
+const char *dfu_func_descriptor_to_string(struct usb_dfu_func_descriptor *func_desc)
+{
+	static char str_buffer[512] = "";
+	size_t str_buffer_size = 0;
+
+	str_buffer[0] = '\0';
+
+	int ret = 0;
+
+	if( (ret = snprintf(str_buffer, sizeof(str_buffer)-str_buffer_size,
+			    "wTransferSize = %d, bcdDFUVersion = 0x%.2x, bmAttributes = ",
+			    le16_to_cpu(func_desc->wTransferSize),
+			    le16_to_cpu(func_desc->bcdDFUVersion))) <= 0 )
+		return "";
+	str_buffer_size += ret;
+
+	if(func_desc->bmAttributes & USB_DFU_CAN_DOWNLOAD)
+	{
+		if( (ret = snprintf(&str_buffer[str_buffer_size],
+				    sizeof(str_buffer)-str_buffer_size,
+				    "%s ", "bitCanDownload")) <= 0 )
+			return "";
+		str_buffer_size += ret;
+	}
+
+	if(func_desc->bmAttributes & USB_DFU_CAN_UPLOAD)
+	{
+		if( (ret = snprintf(&str_buffer[str_buffer_size],
+				    sizeof(str_buffer)-str_buffer_size,
+				    "%s ", "bitCanUpload")) <= 0 )
+			return "";
+		str_buffer_size += ret;
+	}
+
+	if(func_desc->bmAttributes & USB_DFU_MANIFEST_TOL)
+	{
+		if( (ret = snprintf(&str_buffer[str_buffer_size],
+				    sizeof(str_buffer)-str_buffer_size,
+				    "%s ", "bitManifestationTolerant")) <= 0 )
+			return "";
+		str_buffer_size += ret;
+	}
+
+	if(func_desc->bmAttributes & USB_DFU_WILL_DETACH)
+	{
+		if( (ret = snprintf(&str_buffer[str_buffer_size],
+				    sizeof(str_buffer)-str_buffer_size,
+				    "%s ", "bitWillDetach")) <= 0 )
+			return "";
+		str_buffer_size += ret;
+	}
+
+	return str_buffer;
+}

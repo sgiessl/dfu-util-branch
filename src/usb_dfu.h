@@ -8,9 +8,12 @@
  * This ought to be compliant to the USB DFU Spec 1.0 as available from
  * http://www.usb.org/developers/devclass_docs/usbdfu10.pdf
  *
+ * By chance, some bits of DFU 1.1 MIGHT be implemented as well
+ * http://www.usb.org/developers/devclass_docs/DFU_1.1.pdf
  */
 
 #include <sys/types.h>
+#include <stdint.h>
 
 #define USB_DT_DFU			0x21
 
@@ -21,10 +24,12 @@ struct usb_dfu_func_descriptor {
 #define USB_DFU_CAN_DOWNLOAD	(1 << 0)
 #define USB_DFU_CAN_UPLOAD	(1 << 1)
 #define USB_DFU_MANIFEST_TOL	(1 << 2)
-#define USB_DFU_WILL_DETACH	(1 << 3)
+#define USB_DFU_WILL_DETACH	(1 << 3) /*< bitWillDetach is DFU 1.1 */
 	u_int16_t		wDetachTimeOut;
 	u_int16_t		wTransferSize;
-	u_int16_t		bcdDFUVersion;
+	u_int16_t		bcdDFUVersion; /*< bcdDFUVersion is DFU 1.1 */
+#define USB_DFU_VER_1_0         (0x01)
+#define USB_DFU_VER_1_1         (0x02)
 } __attribute__ ((packed));
 
 #define USB_DT_DFU_SIZE			9
@@ -49,6 +54,7 @@ struct dfu_status {
 } __attribute__((packed));
 #endif
 
+/* DFU status */
 #define DFU_STATUS_OK			0x00
 #define DFU_STATUS_errTARGET		0x01
 #define DFU_STATUS_errFILE		0x02
@@ -66,6 +72,7 @@ struct dfu_status {
 #define DFU_STATUS_errUNKNOWN		0x0e
 #define DFU_STATUS_errSTALLEDPKT	0x0f
 
+/* DFU states */
 enum dfu_state {
 	DFU_STATE_appIDLE		= 0,
 	DFU_STATE_appDETACH		= 1,
@@ -75,20 +82,24 @@ enum dfu_state {
 	DFU_STATE_dfuDNLOAD_IDLE	= 5,
 	DFU_STATE_dfuMANIFEST_SYNC	= 6,
 	DFU_STATE_dfuMANIFEST		= 7,
-	DFU_STATE_dfuMANIFEST_WAIT_RST	= 8,
+	DFU_STATE_dfuMANIFEST_WAIT_RESET= 8,
 	DFU_STATE_dfuUPLOAD_IDLE	= 9,
 	DFU_STATE_dfuERROR		= 10,
+	dfu_state_count
 };
 
-/* this is the 'swapped' definition, i.e. after/before mirroring */
+/* this is original binary representation (reversed form of the
+   negative definition from DFU spec) */
 struct dfu_file_suffix {
-	u_int32_t dwCRC;	/* CRC32 ANSI X3.66 */
-	u_int8_t bLength;	/* 16 bytes */
-	char ucDfuSignature[3];	/* "DFU" */
-	u_int16_t bcdDFU;	/* Version */
-	u_int16_t idVendor;	/* VendorID */
-	u_int16_t idProduct;	/* ProductID */
-	u_int16_t bcdDevice;	/* Device Revision, or 0xffff */
+	uint16_t bcdDevice;	    /* Device Revision, or 0xffff */
+	uint16_t idProduct;	    /* ProductID */
+	uint16_t idVendor;	    /* VendorID */
+	uint16_t bcdDFU;	    /* Version */
+	uint8_t  ucDfuSignature[3]; /* "DFU" */
+	uint8_t  bLength;	/* 16 bytes */
+	uint32_t dwCRC;		/* CRC32 ANSI X3.66 */
 } __attribute__ ((packed));
+#define DFU_FILE_SUFFIX_SIZE (sizeof(struct dfu_file_suffix))
+
 
 #endif /* _USB_DFU_H */

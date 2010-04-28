@@ -30,6 +30,7 @@
 #include <errno.h>
 
 #include "dfu.h"
+#include "dfu_sm.h"
 #include "usb_dfu.h"
 #include "sam7dfu.h"
 #include "dfu-version.h"
@@ -40,14 +41,6 @@
 #ifdef HAVE_USBPATH_H
 #include <usbpath.h>
 #endif
-
-/* define a portable function for reading a 16bit little-endian word */
-unsigned short get_int16_le(const void *p)
-{
-    const unsigned char *cp = p;
-
-    return ( cp[0] ) | ( ((unsigned short)cp[1]) << 8 );
-}
 
 int debug;
 static int verbose = 0;
@@ -384,7 +377,12 @@ static void help(void)
 		"  -t --transfer-size\t\tSpecify the number of bytes per USB Transfer\n"
 		"  -U --upload file\t\tRead firmware from device into <file>\n"
 		"  -D --download file\t\tWrite firmware from <file> into device\n"
+	        "  -C --compare file\t\tUpload firmware from device and check if it equals <file>\n"
+	        "  -S --add-suffix file\t\tAppend DFU suffix to raw firmware <file>, including checksum and device info set via -d\n"
 		"  -R --reset\t\t\tIssue USB Reset signalling once we're finished\n"
+	        "  -Q --list-quirks\t\t\tList known work-arounds for device specific quirks\n"
+	        "  -N --no-quirk\t\t\tDisable all device specific work-arounds, and adhere to DFU standards\n"
+	        "  -q --quirk qId\t\t\tEnable quirk qId. using -q disables quirk auto-detection\n"
 		);
 }
 
@@ -409,13 +407,19 @@ static struct option opts[] = {
 	{ "transfer-size", 1, 0, 't' },
 	{ "upload", 1, 0, 'U' },
 	{ "download", 1, 0, 'D' },
+	{ "compare", 1, 0, 'C' },
+	{ "add-suffix", 1, 0, 'S' },
 	{ "reset", 0, 0, 'R' },
+	{ "list-quirks", 0, 0, 'Q' },
+	{ "no-quirk", 0, 0, 'N' },
+	{ "quirk", 1, 0, 'q' },
 };
 
 enum mode {
 	MODE_NONE,
 	MODE_UPLOAD,
 	MODE_DOWNLOAD,
+	MODE_COMPARE
 };
 
 int main(int argc, char **argv)
@@ -427,7 +431,9 @@ int main(int argc, char **argv)
 	unsigned int transfer_size = 0;
 	enum mode mode = MODE_NONE;
 	struct dfu_status status;
-	struct usb_dfu_func_descriptor func_dfu;
+	int quirks_auto_detect = 1;
+	dfu_quirks manual_quirks;
+	dfu_handle handle;
 	char *filename = NULL;
 	char *alt_name = NULL; /* query alt name if non-NULL */
 	char *end;
@@ -438,6 +444,8 @@ int main(int argc, char **argv)
 	printf("dfu-util - (C) 2007-2008 by OpenMoko Inc.\n"
 	       "This program is Free Software and has ABSOLUTELY NO WARRANTY\n\n");
 
+	dfu_quirks_clear(&manual_quirks);
+
 	memset(dif, 0, sizeof(*dif));
 
 	usb_init();
@@ -447,7 +455,7 @@ int main(int argc, char **argv)
 
 	while (1) {
 		int c, option_index = 0;
-		c = getopt_long(argc, argv, "hVvld:p:c:i:a:t:U:D:R", opts,
+		c = getopt_long(argc, argv, "hVvld:p:c:i:a:t:U:D:C:S:RQNq:", opts,
 				&option_index);
 		if (c == -1)
 			break;
@@ -521,9 +529,32 @@ int main(int argc, char **argv)
 			mode = MODE_DOWNLOAD;
 			filename = optarg;
 			break;
+		case 'C':
+			mode = MODE_COMPARE;
+			/* TODO: verify firmware */
+			filename = optarg;
+			break;
+		case 'S':
+			filename = optarg;
+			add_file_suffix(filename);
+			exit(0);
+			break;
 		case 'R':
 			final_reset = 1;
 			break;
+
+		case 'Q':
+			dfu_quirks_print();
+			exit(0);
+			break;
+		case 'N':
+			quirks_auto_detect = 0;
+			break;
+		case 'q':
+			quirks_auto_detect = 0;
+			dfu_quirk_set(&manual_quirks, atoi(optarg));
+			break;
+
 		default:
 			help();
 			exit(2);
@@ -542,7 +573,7 @@ int main(int argc, char **argv)
 		exit(2);
 	}
 
-	dfu_init(5000);
+	dfu_init(&handle, 5000);
 
 	num_devs = count_dfu_devices(dif);
 	if (num_devs == 0) {
@@ -575,60 +606,117 @@ int main(int argc, char **argv)
 	if (!get_first_dfu_if(&_rt_dif))
 		exit(1);
 
+	handle.device = _rt_dif.dev_handle;
+	handle.interface = _rt_dif.interface;
+
+	/* automatic quirk detection */
+	if(quirks_auto_detect)
+	{
+		/* TODO: let the detection be influenced by bcdDFU, bcdDevice */
+		handle.quirk_flags = dfu_quirks_detect(0, dif->vendor, dif->product, 0);
+	}
+	/* merge with manual quirks */
+	dfu_quirks_insert(&handle.quirk_flags, &manual_quirks);
+	if(!dfu_quirks_is_empty(&handle.quirk_flags))
+	{
+		printf("Selected quirks: ");
+		dfu_quirks_print_set(&handle.quirk_flags);
+		printf("\n");
+	}
+
 	if (!_rt_dif.flags & DFU_IFF_DFU) {
 		/* In the 'first round' during runtime mode, there can only be one
 	 	* DFU Interface descriptor according to the DFU Spec. */
 
 		/* FIXME: check if the selected device really has only one */
 
-		printf("Claiming USB DFU Runtime Interface...\n");
+		printf("Claiming USB DFU Runtime Interface %d...\n",
+		       _rt_dif.interface);
 		if (usb_claim_interface(_rt_dif.dev_handle, _rt_dif.interface) < 0) {
 			fprintf(stderr, "Cannot claim interface: %s\n",
 				usb_strerror());
 			exit(1);
 		}
 
+		/* DFU 1.0, Table 4.1: in runtime-mode, alternate
+		   interface setting must be zero. therefore we can
+		   assume, '0' is correct.
+
+		   the reason we use usb_set_altinterface() here:
+		   switch devices to the interface set using
+		   usb_claim_interface() above - for some reason this
+		   isn't done there.  is the only libusb API which
+		   issues the SET_INTERFACE USB standard request is
+		   usb_set_altinterface()
+		*/
 		if (usb_set_altinterface(_rt_dif.dev_handle, 0) < 0) {
-			fprintf(stderr, "Cannot set alt interface: %s\n",
+			fprintf(stderr, "Cannot set alternate interface %d: %s\n",
+				0,
 				usb_strerror());
 			exit(1);
 		}
 
-		printf("Determining device status: ");
-		if (dfu_get_status(_rt_dif.dev_handle, _rt_dif.interface, &status ) < 0) {
-			fprintf(stderr, "error get_status: %s\n",
-				usb_strerror());
+		printf("Determining device state: ");
+		int state = -1;
+		if ( (state = dfu_get_state(&handle)) < 0) {
 			exit(1);
 		}
-		printf("state = %s, status = %d\n", 
-		       dfu_state_to_string(status.bState), status.bStatus);
+		printf("state = %s\n", dfu_state_to_string(state));
+
+		dfu_sm_set_state_unchecked(&handle, state);
+
+		printf("Determining device status: ");
+		if (dfu_get_status(&handle, &status ) < 0) {
+			exit(1);
+		}
+
+		printf("state = %s, status = %d = \"%s\"\n",
+		       dfu_state_to_string(status.bState),
+		       status.bStatus,
+		       dfu_status_to_string(status.bStatus) );
 
 		switch (status.bState) {
 		case DFU_STATE_appIDLE:
 		case DFU_STATE_appDETACH:
 			printf("Device really in Runtime Mode, send DFU "
 			       "detach request...\n");
-			if (dfu_detach(_rt_dif.dev_handle, 
-				       _rt_dif.interface, 1000) < 0) {
-				fprintf(stderr, "error detaching: %s\n",
-					usb_strerror());
-				exit(1);
-				break;
+
+			if(status.bState == DFU_STATE_appDETACH) {
+				printf("Device is already in state %s, skipping DFU_DETACH request\n",
+				       dfu_state_to_string(status.bState));
 			}
-			printf("Resetting USB...\n");
-			ret = usb_reset(_rt_dif.dev_handle);
-			if (ret < 0 && ret != -ENODEV)
-				fprintf(stderr,
-					"error resetting after detach: %s\n", 
-					usb_strerror());
+			else
+			{
+				if (dfu_detach(&handle, 1000) < 0) {
+					exit(1);
+					break;
+				}
+			}
+
+			/* handle bitWillDetach (DFU 1.1) */
+			if(handle.dfu_ver == DFU_VERSION_1_1 &&
+			   handle.func_dfu.bmAttributes & USB_DFU_WILL_DETACH)
+			{
+				/* TODO: test this with a real DFU 1.1 device */
+				printf("Waiting for USB device's own detach (bitWillDetach=1)...\n");
+				dfu_sm_set_state_checked(&handle,
+							 DFU_STATE_dfuIDLE);
+			}
+			else
+			{
+				printf("Resetting USB...\n");
+				ret = dfu_usb_reset(&handle);
+				if (ret < 0 && ret != -ENODEV)
+				{
+					/* do nothing; error msg is output in dfu_usb_reset. */
+				}
+			}
+
 			sleep(2);
 			break;
 		case DFU_STATE_dfuERROR:
 			printf("dfuERROR, clearing status\n");
-			if (dfu_clear_status(_rt_dif.dev_handle,
-					     _rt_dif.interface) < 0) {
-				fprintf(stderr, "error clear_status: %s\n",
-					usb_strerror());
+			if (dfu_clear_status(&handle) < 0) {
 				exit(1);
 				break;
 			}
@@ -684,7 +772,7 @@ int main(int argc, char **argv)
 		 * procedure */
 	}
 
-dfustate:
+ dfustate:
 	if (alt_name) {
 		int n;
 
@@ -713,7 +801,7 @@ dfustate:
 				"DFU IF\n");
 			exit(1);
 		}
-	} else if (num_ifs > 1 && !(dif->flags & (DFU_IFF_IFACE|DFU_IFF_ALT))) {
+	} else if (num_ifs > 1 && (!dif->flags) & (DFU_IFF_IFACE|DFU_IFF_ALT)) {
 		fprintf(stderr, "We have %u DFU Interfaces/Altsettings, "
 			"you have to specify one via --intf / --alt options\n",
 			num_ifs);
@@ -742,14 +830,21 @@ dfustate:
 		exit(1);
 	}
 
-status_again:
+	/* update the handle to point to the dfu-mode descriptor */
+	handle.device = dif->dev_handle;
+	handle.interface = dif->interface;
+
+ status_again:
 	printf("Determining device status: ");
-	if (dfu_get_status(dif->dev_handle, dif->interface, &status ) < 0) {
+	if (dfu_get_status(&handle, &status ) < 0) {
 		fprintf(stderr, "error get_status: %s\n", usb_strerror());
 		exit(1);
 	}
 	printf("state = %s, status = %d\n",
 	       dfu_state_to_string(status.bState), status.bStatus);
+
+	/* force the statemachine into current status */
+	dfu_sm_set_state_unchecked(&handle, status.bState);
 
 	switch (status.bState) {
 	case DFU_STATE_appIDLE:
@@ -759,7 +854,7 @@ status_again:
 		break;
 	case DFU_STATE_dfuERROR:
 		printf("dfuERROR, clearing status\n");
-		if (dfu_clear_status(dif->dev_handle, dif->interface) < 0) {
+		if (dfu_clear_status(&handle) < 0) {
 			fprintf(stderr, "error clear_status: %s\n",
 				usb_strerror());
 			exit(1);
@@ -769,7 +864,7 @@ status_again:
 	case DFU_STATE_dfuDNLOAD_IDLE:
 	case DFU_STATE_dfuUPLOAD_IDLE:
 		printf("aborting previous incomplete transfer\n");
-		if (dfu_abort(dif->dev_handle, dif->interface) < 0) {
+		if (dfu_abort(&handle) < 0) {
 			fprintf(stderr, "can't send DFU_ABORT: %s\n",
 				usb_strerror());
 			exit(1);
@@ -781,30 +876,80 @@ status_again:
 		break;
 	}
 
-	if (!transfer_size) {
-		/* Obtain DFU functional descriptor */
-		ret = usb_get_descriptor(dif->dev_handle, 0x21, dif->interface,
-					 &func_dfu, sizeof(func_dfu));
-		if (ret < 0) {
-			fprintf(stderr, "Error obtaining DFU functional "
-				"descriptor: %s\n", usb_strerror());
-			transfer_size = page_size;
-		} else {
-			transfer_size = get_int16_le(&func_dfu.wTransferSize);
+	/* Obtain DFU functional descriptor */
+	ret = usb_get_descriptor(dif->dev_handle, 0x21, dif->interface,
+				 &(handle.func_dfu), sizeof(handle.func_dfu));
+	if (ret < 0) {
+		fprintf(stderr, "Error obtaining DFU functional "
+			"descriptor: %s\n", usb_strerror());
+
+		if(dfu_quirk_is_set(&handle.quirk_flags,
+				    QUIRK_IGNORE_INVALID_FUNCTIONAL_DESCRIPTOR))
+		{
+			handle.func_dfu.bmAttributes =
+				USB_DFU_CAN_DOWNLOAD |
+				USB_DFU_CAN_UPLOAD |
+				USB_DFU_MANIFEST_TOL;
+
+			handle.func_dfu.wTransferSize = cpu_to_le16(transfer_size);
+			if(!transfer_size)
+				transfer_size = page_size;
+
+			handle.func_dfu.bcdDFUVersion = USB_DFU_VER_1_0;
+
+			fprintf(stderr, "   Still, try to continue with default flags/manual settings.\n");
+		}
+		else
+		{
+			exit(1);
 		}
 	}
+	else
+	{
+		transfer_size = le16_to_cpu(handle.func_dfu.wTransferSize);
+	}
 
+	/* why is this limited to page_size, a host-dependent value? (sgiessl) */
 	if (transfer_size > page_size)
 		transfer_size = page_size;
-	
+
+	/* quirk overwriting DFU version */
+	if(dfu_quirk_is_set(&handle.quirk_flags, QUIRK_FORCE_DFU_VERSION_1_0))
+	{
+		handle.func_dfu.bcdDFUVersion = USB_DFU_VER_1_0;
+	}
+	else if(dfu_quirk_is_set(&handle.quirk_flags, QUIRK_FORCE_DFU_VERSION_1_1))
+	{
+		handle.func_dfu.bcdDFUVersion = USB_DFU_VER_1_1;
+	}
+
+	/* read DFU version */
+	switch(handle.func_dfu.bcdDFUVersion)
+	{
+	case USB_DFU_VER_1_1:
+		handle.dfu_ver = DFU_VERSION_1_1;
+		break;
+
+	default:
+		printf("WARNING: device specifies unknown DFU version 0x%.2x, defaulting to DFU 1.0\n",
+		       handle.func_dfu.bcdDFUVersion);
+		/* fall through intended */
+	case USB_DFU_VER_1_0:
+		handle.dfu_ver = DFU_VERSION_1_0;
+		break;
+	}
+
 	printf("Transfer Size = 0x%04x\n", transfer_size);
+
+	printf("Device functional descriptor: %s\n",
+	       dfu_func_descriptor_to_string(&handle.func_dfu));
 
 	if (DFU_STATUS_OK != status.bStatus ) {
 		printf("WARNING: DFU Status: '%s'\n",
 			dfu_status_to_string(status.bStatus));
 		/* Clear our status & try again. */
-		dfu_clear_status(dif->dev_handle, dif->interface);
-		dfu_get_status(dif->dev_handle, dif->interface, &status);
+		dfu_clear_status(&handle);
+		dfu_get_status(&handle, &status);
 
 		if (DFU_STATUS_OK != status.bStatus) {
 			fprintf(stderr, "Error: %d\n", status.bStatus);
@@ -814,12 +959,12 @@ status_again:
 
 	switch (mode) {
 	case MODE_UPLOAD:
-		if (sam7dfu_do_upload(dif->dev_handle, dif->interface,
+		if (sam7dfu_do_upload(&handle,
 				  transfer_size, filename) < 0)
 			exit(1);
 		break;
 	case MODE_DOWNLOAD:
-		if (sam7dfu_do_dnload(dif->dev_handle, dif->interface,
+		if (sam7dfu_do_dnload(&handle,
 				  transfer_size, filename) < 0)
 			exit(1);
 		break;
@@ -829,8 +974,15 @@ status_again:
 	}
 
 	if (final_reset) {
-		if (dfu_detach(dif->dev_handle, dif->interface, 1000) < 0) {
-			fprintf(stderr, "can't detach: %s\n", usb_strerror());
+		if(dfu_quirk_is_set(&handle.quirk_flags, QUIRK_OPENMOKO_DETACH_BEFORE_FINAL_RESET))
+		{
+			/* DFU_DETACH is only allowed in appIDLE, so
+			   this is non-standard (as of DFU 1.0, and
+			   1.1). */
+			printf("Initiating reset by sending DFU_DETACH (QUIRK_OPENMOKO_DETACH_BEFORE_FINAL_RESET)\n");
+			if (dfu_detach(&handle, 1000) < 0) {
+				fprintf(stderr, "can't detach: %s\n", usb_strerror());
+			}
 		}
 		printf("Resetting USB to switch back to runtime mode\n");
 		ret = usb_reset(dif->dev_handle);
